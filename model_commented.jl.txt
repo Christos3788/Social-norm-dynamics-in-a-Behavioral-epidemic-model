@@ -1,0 +1,763 @@
+# ============================================================================
+# Behavioral Epidemic ABM with Social Norm Dynamics (Julia)
+# ----------------------------------------------------------------------------
+# This file is the author's original code with added explanatory comments ONLY.
+# No functional changes were made. All variable names, logic, and outputs
+# remain intact. Comments explain intent, data flow, and algorithmic choices.
+# ============================================================================
+
+using LightGraphs
+using Random
+using Shuffle
+using Distributions
+using StatsBase
+using LinearAlgebra
+using SparseArrays
+using Arpack
+using ArgParse
+using Distributed
+using DataFrames
+using CSV
+using DelimitedFiles
+
+# ==============================
+# DEFINE GENERAL MODEL PARAMETERS 
+# ==============================
+
+start_time = time()           # wall-clock timer for total execution
+
+runn=0                        # run index / replicate id (used in file names)
+
+# ---------- Social weighting parameters (used in attitude updates) ----------
+gammasocial1=1.0
+gammasocial2=1.0
+gammasocial3=1.0
+
+# ---------- Population and network choice ----------
+N = 100                      # Number of agents/nodes
+networkOption=1               # 1: ER + extra links (both layers ~= ER-ish)
+                              # otherwise: small-world (physical) + Klimek-Thurner (social)
+
+# --------------------------- ER NETWORK SETUP -------------------------------
+k1mean=5                      # target mean degree in ER(physical) layer
+p1=k1mean/N                   # ER link prob for layer 1
+minint=0.95                   # require >= 95% of nodes in giant component (physical)
+
+k2meanextra=1                 # expected *extra* links added to 2nd layer when networkOption==1
+p2extra=k2meanextra/N
+
+# ------------------- SMALL WORLD / KLIMEK-THURNER SETUP --------------------
+# Parameters when using the alternative two-layer setup:
+k = 6                         # average degree for Watts–Strogatz small-world (physical)
+betaS = 0.3                   # rewiring probability (physical)
+
+# Klimek–Thurner-like growth/turnover (social layer)
+r = 0.58                      # triadic closure probability
+p = 0.12                      # node turnover probability
+m = 1                         # # of new edges on reintroduction
+
+c=1                           # if 1, prefer rewire to existing neighbors in G1 (overlap control)
+
+# ============================== EPIDEMIC DYNAMICS ===========================
+beta=6.0                      # infection rate parameter (per-contact, event-driven)
+mu=1.0                        # recovery rate parameter
+Nsim=10*N                     # # of SIR simulations per season to estimate risk components
+vacCycles=100                 # # of vaccination seasons (outer loop)
+
+# ============================== LEARNING / COSTS ============================
+CI=1                          # Cost of infection (unvaccinated baseline)
+CV=0.1                        # Cost of vaccination
+mem=4                         # memory length used in various histories
+memChoice2=mem
+memPayoff2=mem
+
+
+# ============================== SOCIAL NORMS (global) =======================
+GVac=0.0                      # external authority signal toward vaccination (0..1)
+adap=1.00                     # adaptation rate baseline
+
+attiVacadap=0.01*adap
+
+attiAvVacadap=0.1*adap
+
+prefAvVacadap=adap
+
+# ------------------------- Reproducibility: random seed ---------------------
+rseed=abs(rand(Int, 1)[1])    # draw a seed from current RNG
+Random.seed!(rseed)           # fix RNG for this run
+
+# ============================== Utility helpers =============================
+
+# Return the main (largest) connected component of a graph
+function main_component(g)
+    c = connected_components(g)
+    _, i = findmax(length.(c))
+    g[c[i]]
+end
+
+# Event-driven SIR on a static contact network
+# - mu: recovery rate
+# - beta1: infection rate
+# - listneigh1: adjacency list for "physical" layer (SIR acts here)
+# - ndVac: vector of vaccination states (1=unvaccinated, 2=vaccinated)
+# - ndDiseaseSimpp: initial disease state (1=S, 2=I, will become 3=R if infected, 4=protected?)
+function event_driven(mu,beta1,listneigh1,ndVac,ndDiseaseSimpp)
+    # Exponential clocks for recovery and infection
+    global dmu=Exponential(1/mu)
+    global dbeta=Exponential(1/beta1)
+
+    # Priority queue as a time-ordered list of events: [time, [source, target]]
+    # Recovery events use source==target to tag self-recovery
+    global sortedqbinlist = Vector{Any}(undef,0)
+
+    # Seed event list from initially infected nodes
+    for il in 1:N
+        if ndDiseaseSimpp[il]==2  # infected
+            global rectime=rand(dmu)
+            push!(sortedqbinlist,[rectime,[il,il]]) # schedule recovery
+
+            # Try infect each susceptible unvaccinated neighbor before recovery
+            for ij in 1:length(listneigh1[il])
+                if ndDiseaseSimpp[listneigh1[il][ij]]==1 && ndVac[listneigh1[il][ij]]==1
+                    global inftime=rand(dbeta)
+                    if inftime<rectime
+                        # Keep only earliest infection for each target
+                        global ss=1
+                        global check0=0
+                        while ss<=length(sortedqbinlist) && check0==0
+                            if sortedqbinlist[ss][2][2]==listneigh1[il][ij]
+                                if inftime<sortedqbinlist[ss][1]
+                                    sortedqbinlist[ss]=deepcopy([inftime,[il,listneigh1[il][ij]]])
+                                end
+                                check0=1
+                            end
+                            ss+=1
+                        end
+                        if check0==0
+                            push!(sortedqbinlist,[inftime,[il,listneigh1[il][ij]]])
+                        end
+                    end
+                end
+            end
+        end
+        # keep event list sorted by event time
+        sortedqbinlist = sort(sortedqbinlist,by=x -> x[1])
+    end
+
+    global check=0
+    # Process events in time order until empty
+    while check==0
+        if sortedqbinlist[1][2][1]==sortedqbinlist[1][2][2]
+            # Recovery event
+            ndDiseaseSimpp[sortedqbinlist[1][2][1]]=3
+        elseif ndDiseaseSimpp[sortedqbinlist[1][2][2]]==1 && sortedqbinlist[1][2][1]!=sortedqbinlist[1][2][2] && ndVac[sortedqbinlist[1][2][2]]==1 
+            # Infection event on susceptible, unvaccinated target
+            global newinf=deepcopy(sortedqbinlist[1][2][2])
+            global ndDiseaseSimpp[newinf]=2
+            global rectime=rand(dmu)+sortedqbinlist[1][1]
+            push!(sortedqbinlist,[rectime,[newinf,newinf]])  # schedule their recovery
+            # Schedule possible transmissions from the newly infected
+            for il in 1:length(listneigh1[newinf])
+                if ndDiseaseSimpp[listneigh1[newinf][il]]==1 && ndVac[listneigh1[newinf][il]]==1
+                    global inftime=rand(dbeta)+sortedqbinlist[1][1]
+                    if inftime<rectime
+                        global ss=1
+                        global check0=0
+                        while ss<=length(sortedqbinlist) && check0==0
+                            if sortedqbinlist[ss][2][2]==listneigh1[newinf][il]
+                                if inftime<sortedqbinlist[ss][1]
+                                    sortedqbinlist[ss]=deepcopy([inftime,[newinf,listneigh1[newinf][il]]])
+                                end
+                                check0=1
+                            end
+                            ss+=1
+                        end
+                        if check0==0
+                            push!(sortedqbinlist,[inftime,[newinf,listneigh1[newinf][il]]])
+                        end
+                    end
+                end
+            end
+        elseif ndDiseaseSimpp[sortedqbinlist[1][2][2]]==1 && sortedqbinlist[1][2][1]!=sortedqbinlist[1][2][2] && ndVac[sortedqbinlist[1][2][2]]==2 
+            # Attempted infection of vaccinated target -> mark as '4' (exposed but protected)
+            ndDiseaseSimpp[sortedqbinlist[1][2][2]]=4
+        end
+        deleteat!(sortedqbinlist,1)
+        if length(sortedqbinlist)>0
+            sortedqbinlist = deepcopy(sort(sortedqbinlist,by=x -> x[1]))
+        else 
+            check=1
+        end
+    end
+    return ndDiseaseSimpp
+end
+
+# ------------------------- Pack parameters for logging -----------------------
+Params=[N,k1mean,mu,beta,CI,mem,CV,Nsim,vacCycles,rseed]
+
+global sume
+sume=0.0
+for i in 1:length(Params)-1
+    global sume+=Params[i]*10^(i-3.0)
+end
+
+# Persist parameters once per run
+if runn==0
+    ParamsString=string("Params_",sume,"_",runn,"_Holme.csv")
+    writedlm( ParamsString,  Params, ',')
+end
+
+# =========================== START EVOLUTION ================================
+# Initialize memory structures and (later) networks
+
+# ---------- Initialize payoffs history (length = memPayoff2) ----------------
+Payoffhist2init=Vector{Any}(undef,N)
+for ii in 1:N
+    initPayoffhist=Vector{Float64}(undef,0)
+    for iu in 1:memPayoff2
+        push!(initPayoffhist,-rand())     # seed with negative random payoffs
+    end
+    Payoffhist2init[ii]=initPayoffhist
+end
+global Payoffhist2=deepcopy(Payoffhist2init)
+
+# ============================ Network constructors ==========================
+
+# Watts–Strogatz small-world
+function small_world_network(n::Int, k::Int, ß::Float64)
+    return watts_strogatz(n, k, ß)
+end
+
+# Klimek–Thurner-like evolving social network with overlap bias to G1
+# G1: reference (physical) network to bias towards overlapping neighbors
+function klimek_thurner_network(n::Int, r::Float64, p::Float64, m::Int, G1::SimpleGraph,c)
+    g = SimpleGraph(n)
+
+    # Initial: connect each node to one partner (prefer neighbor from G1 if c≈1)
+    for i in 1:n
+        if rand()<c
+            potential=Random.shuffle(neighbors(G1, i))  # assume G1 connected
+            count=0
+            s=potential[count+1]
+            add_edge!(g, i, s)
+        else
+            s=rand(1:n)
+            add_edge!(g, i, s)
+        end
+    end
+
+    # Evolution for 5*n steps (mixing)
+    for _ in 1:5n
+        i = rand(1:n)  # focal node
+        
+        if degree(g, i) < 2
+            # ensure basic connectivity for low-degree nodes
+            potential1=setdiff(neighbors(G1, i),neighbors(g, i))
+            if rand()<c && !isempty(potential1)
+                potential=Random.shuffle(potential1)
+                count=1
+                s=potential[count]
+                while has_edge(g, i, s)==true && count<length(potential)
+                    count+=1
+                    s=potential[count]
+                end
+                add_edge!(g, i, s)
+            else
+                s=rand(1:n)
+                while has_edge(g, i, s)==true
+                    s=rand(1:n)
+                end
+                add_edge!(g, i, s)
+            end
+        else
+            # pick a random neighbor j and try triadic closure / redirection
+            neighbors_i = neighbors(g, i)
+            j = rand(neighbors_i)
+            
+            neighbors_iG1 = neighbors(G1, i)            
+            inter = intersect(neighbors_i,neighbors_iG1)
+            potential_nodesC = Random.shuffle(setdiff(inter, [j]))
+            potential_nodes = Random.shuffle(setdiff(neighbors_i, [j]))
+            
+            if rand() < r  # triadic closure with prob r
+                if rand()<c && !isempty(potential_nodesC)
+                    count=1
+                    s=potential_nodesC[count]
+                    while has_edge(g, j, s)==true && count<length(potential_nodesC)
+                        count+=1
+                        s=potential_nodesC[count]
+                    end
+                    add_edge!(g, j, s)
+                else
+                    count=1
+                    s=potential_nodes[count]
+                    while has_edge(g, j, s)==true && count<length(potential_nodes)
+                        count+=1
+                        s=potential_nodes[count]
+                    end
+                    add_edge!(g, j, s)
+                end
+            else
+                # random redirection (prefer G1 neighbors if c high)
+                potential=Random.shuffle(setdiff(neighbors(G1, j),neighbors(g, j)))
+                if rand()<c && !isempty(potential)
+                    count=1
+                    s=potential[count]
+                    while has_edge(g, j, s)==true && count<length(potential) 
+                        count+=1
+                        s=potential[count]
+                    end
+                    add_edge!(g, j, s)
+                else
+                    s=rand(1:n)
+                    while has_edge(g, j, s)==true
+                        s=rand(1:n)
+                    end
+                    add_edge!(g, j, s)
+                end
+            end
+        end
+
+        # Node turnover with prob p: remove all edges then add m new ones
+        if rand() < p
+            node_to_remove = rand(1:n)
+            node_neighbors = neighbors(g, node_to_remove)
+            for neighbor in node_neighbors
+                rem_edge!(g, node_to_remove, neighbor)
+            end
+            for _ in 1:m
+                potentialp=setdiff(neighbors(G1, node_to_remove),neighbors(g, node_to_remove))
+                potential=Random.shuffle(potentialp)
+                if rand()<c && !isempty(potential)
+                    count=1
+                    s=potential[count]
+                    while has_edge(g, node_to_remove, s)==true && count<length(potential)
+                        count+=1
+                        s=potential[count]
+                    end
+                    add_edge!(g, node_to_remove, s)
+                else
+                    s=rand(1:n)
+                    while has_edge(g, node_to_remove, s)==true
+                        s=rand(1:n)
+                    end
+                    add_edge!(g, node_to_remove, s)
+                end
+            end
+        end
+    end
+    return g
+end
+
+# ============================ Build the two layers ===========================
+if networkOption==1
+    # --- Layer 1 (physical): ER with giant component >= minint*N ---
+    global a1p=0
+    while a1p<=Int(round(N*minint))
+        global g1=erdos_renyi(N,p1)
+        global g1p = main_component(g1)
+        global a1p=length(collect(vertices(g1p)))
+    end
+
+    # adjacency lists
+    listnegh1=Vector{Any}(undef,0)  # (typo preserved) physical
+    listneigh1=Vector{Any}(undef,0)
+    for ij in 1:N
+        neigh=deepcopy(neighbors(g1,ij))
+        push!(listneigh1,neigh)
+    end
+
+    # Layer 2 (social): start as a copy of physical neighbors, then add extra ER links
+    listneigh2=deepcopy(listneigh1)
+
+    # helper: sample new node(s) not in m
+    function sample_excluding(N::Int, m::Vector{Int}, k::Int=1)
+        available = setdiff(1:N, m)
+        return rand(available, k)
+    end
+
+    # Add extra random edges to layer 2 to reach mean increase ~k2meanextra
+    for ij in 1:N
+        for ij1 in ij+1:N
+            if rand()<p2extra
+                if !(ij1 in listneigh2[ij])
+                    push!(listneigh2[ij],ij1)
+                    push!(listneigh2[ij1],ij)
+                else
+                    # avoid multi-edges by rewiring to a fresh node
+                    neednewlink=1
+                    while neednewlink==1
+                        sample=sample_excluding(N, listneigh2[ij], 1)
+                        push!(listneigh2[ij],sample[1])
+                        push!(listneigh2[sample[1]],ij)
+                        neednewlink=0
+                    end
+                end
+            end
+        end
+    end
+else
+    # --- Alternative: Small-world physical + Klimek–Thurner social ---
+    small_world = small_world_network(N, k, betaS)
+    klimek_thurner = klimek_thurner_network(N, r, p, m,small_world,c)
+
+    listneigh1=Vector{Any}(undef,0)
+    for ij in 1:N
+        neigh=deepcopy(neighbors(small_world,ij))
+        push!(listneigh1,neigh)
+    end
+
+    listneigh2=Vector{Any}(undef,0)
+    for ij in 1:N
+        neigh=deepcopy(neighbors(klimek_thurner,ij))
+        push!(listneigh2,neigh)
+    end
+end
+
+# ============================== INITIAL CONDITIONS ==========================
+
+# Vaccination state (decision) vector: 1=unvaccinated, 2=vaccinated
+ndVacinit=Vector{Int64}(undef,N)
+for i in 1:N
+    ndVacinit[i]=1
+end
+ndVacinit=Random.shuffle(ndVacinit) 
+global ndVac=deepcopy(ndVacinit)
+
+# Choice memory (vaccination history) for each agent
+Choicehist2init=Vector{Any}(undef,N)
+for ii in 1:N
+    initChoicehist=Vector{Int64}(undef,0)
+    for iu in 1:memChoice2
+        push!(initChoicehist,rand(1:2))   # seed with random choices
+    end
+    Choicehist2init[ii]=deepcopy(initChoicehist)
+end
+global Choicehist2=deepcopy(Choicehist2init)
+
+# Initialize social norm state variables in [0,1]
+global attiVac=rand(N)        # attitude toward vaccinating (own)
+global attiAvVac=rand(N)      # injunctive expectation (what others think ought to do)
+global prefAvVac=rand(N)      # descriptive preference proxy (used in att_update)
+
+global Cons=Consensus(N,listaVacneigh,listneigh2)
+
+# ============================== Norm similarity φ ============================
+# φ is computed from neighbors' recent choices vs. most recent choice,
+# yielding a "stability/consistency" measure that is then used in the
+# preference update as a weight between social vs. individual components.
+
+function phi_Vac(N::Int,listneigh2::Vector{Any},memChoice2::Int,Choicehist2::Vector{Any})        
+    phiVacS=ones(N)
+    for ii in 1:N
+        len=length(listneigh2[ii])  # use neighbors
+                    
+        if len>0
+            hmat=zeros(Float64, len, 2)   # historical frequency of {1,2}
+            rmat=zeros(Float64, len, 2)   # most recent indicator {1,2}
+
+
+            for jj1 in 1:length(listneigh2[ii])
+                htemp=[0,0]
+                for jj in 1:memChoice2
+                    if Choicehist2[listneigh2[ii][jj1]][jj]==1
+                        htemp+=[1/memChoice2,0]
+                    elseif Choicehist2[listneigh2[ii][jj1]][jj]==2
+                        htemp+=[0,1/memChoice2]
+                    end
+                end
+                hmat[jj1,:]=htemp
+
+                if Choicehist2[listneigh2[ii][jj1]][1]==1
+                    rmat[jj1,:]=[1,0]
+                elseif Choicehist2[listneigh2[ii][jj1]][1]==2
+                    rmat[jj1,:]=[0,1]
+                end 
+            end
+
+            # distance between historical frequencies and most recent choice
+            sumitita=0
+            sumitita1=0
+            dif1=hmat[:,1]-rmat[:,1]
+            dif2=hmat[:,2]-rmat[:,2]
+            for ip in 1:length(hmat[:,1])
+                sumitita+=dif1[ip]^2
+                sumitita1+=dif2[ip]^2
+            end
+
+            SitVac=(sumitita+sumitita1)/length(listneigh2[ii])  # average squared diff
+            phiVacS[ii]=1-SitVac/2   # normalize into [0,1] (1=stable/consistent)
+        end
+    end
+    return phiVacS        
+end             
+
+# φ based on neighbors (social) and on self (inertia)
+phiVac=phi_Vac(N,listneigh2,memChoice2,Choicehist2)
+
+
+# ============================== One-season simulator ========================
+# Runs Nsim event-driven SIR simulations to get:
+# - outsizeS: average outbreak size (fraction infected)
+# - infrateSv: per-agent infection probability (if unvaccinated)
+# - infneighrateSv: per-agent neighbor infection rate (if vaccinated)
+# - Payoffhist2S: updated payoff memory per agent
+function Season_Sim(N::Int, Nsim::Int, ndVac::Vector{Int},mu::Float64,beta::Float64,listneigh1::Vector{Any},Payoffhist2S::Vector{Any},memPayoff2::Int)                              
+    ndDiseaseVecS=Vector{Any}(undef,0)
+    ndDiseaseStateVecS=Vector{Any}(undef,0)
+    sim=0
+    while sim<Nsim
+        # ------------------ Initialize disease seeding ------------------
+        global ndDiseaseSim=Vector{Int64}(undef,N)
+        global ndDisease=Vector{Int64}(undef,N)
+
+        # lim1: #initial infected (exclude vaccinated if possible)
+        global lim1=maximum([minimum([Int(round((N-count(iw->(iw==2),ndVac)))),1]),1])
+        for il in 1:lim1
+            global ndDisease[il]=2   # infected
+        end
+        global lim1p=lim1+1
+        for il in lim1p:N
+            global ndDisease[il]=1   # susceptible
+        end
+        global ndDisease=Random.shuffle(ndDisease)
+
+        # avoid seeding infection in vaccinated individuals if possible
+        for il in 1:N
+            if (ndDisease[il]==2) && ((ndVac[il]==2))
+                checkoui=0
+                checked=Vector{Int64}(undef,0)
+                while checkoui==0 && length(checked)<N
+                    replacement=rand(1:N)
+                    if replacement in checked
+                        checkoui=0
+                    else
+                        if ndDisease[replacement]==1 && ndVac[replacement]==1
+                            ndDiseasetemp=ndDisease[il]
+                            ndDisease[il]=ndDisease[replacement]
+                            ndDisease[replacement]=ndDiseasetemp
+                            checkoui=1
+                        else
+                            push!(checked,replacement)
+                        end
+                    end
+                end
+            end
+        end
+
+        # --------------- Run event-driven SIR and collect states --------
+        global ndDiseaseSimp=deepcopy(ndDisease)
+        global ndDiseaseSim=event_driven(mu,beta,listneigh1,ndVac,ndDiseaseSimp)
+
+        # total infected count (exclude S and "vaccinated-exposed"=4)
+        push!(ndDiseaseVecS,N-(count(iw->(iw==1),ndDiseaseSim)+count(iw->(iw==4),ndDiseaseSim)))
+        push!(ndDiseaseStateVecS,ndDiseaseSim)
+        sim+=1
+    end
+                
+    # ------------------------- Rewards (expected) -----------------------
+    infrateSv=zeros(1,N)       # P(infected) if unvaccinated
+    infneighrateSv=zeros(1,N)  # neighbor infection exposure proxy (for vaccinated)
+    for ii in 1:N
+        sumit=0
+        sumneigh=0
+        for iq in 1:length(ndDiseaseStateVecS)
+            if (ndDiseaseStateVecS[iq][ii]==3) || (ndDiseaseStateVecS[iq][ii]==4)
+                sumit+=1
+            end
+
+            sumneighp=0
+            for iq1 in 1:length(listneigh1[ii])
+                if (ndDiseaseStateVecS[iq][listneigh1[ii][iq1]]==3)
+                    sumneighp+=1/length(listneigh1[ii])
+                end
+            end
+            sumneigh+=sumneighp
+        end
+
+        infrateSv[ii]=sumit/Nsim
+        infneighrateSv[ii]=sumneigh/Nsim
+    end
+                
+    outsizeS=mean(ndDiseaseVecS)/N  # avg outbreak size (fraction)
+                
+    # Update payoff memories given vaccination choice and estimated risks
+    for ij in 1:N
+        Payoff=0
+        if ndVac[ij]==1
+            Payoff+=-CI*(infrateSv[ij])        # expected infection cost if unvaccinated
+        else
+            Payoff+=-CI*(infneighrateSv[ij])   # exposure proxy if vaccinated
+        end
+        Payoffhistp=deepcopy(Payoffhist2S[ij])
+        pushfirst!(Payoffhistp,Payoff)
+        Payoffhist2S[ij]=deepcopy(getindex(Payoffhistp, 1:memPayoff2))
+    end  
+            
+    return outsizeS, infrateSv, infneighrateSv, Payoffhist2S
+end
+                                
+# Utility: check whether last n values are within limit * mean(last n)
+function check_approx_equal(vec, n, limit)
+    if length(vec) < n
+        return false
+    end
+    last_values = vec[end-n+1:end]
+    return all(abs.(last_values .- mean(last_values)) .<= limit*mean(last_values))
+end
+
+# Update of attitudes / preferences under social pressure & φ-weights
+function att_update(prefAvVacS::Vector{Float64},attiVacS::Vector{Float64},attiAvVacS::Vector{Float64},attiVacadap::Float64,attiAvVacadap::Float64,prefAvVacadap::Float64,phiVac::Vector{Float64},Cons::Vector{Float64},prefVacS::Vector{Float64},gammasocial1::Float64,gammasocial2::Float64,gammasocial3::Float64,GVac::Float64,listneigh2::Vector{Any},listaVacneigh::Vector{Float64})
+
+    attiVacSp=deepcopy(attiVacS)
+    attiAvVacSp=deepcopy(attiAvVacS)
+            
+    for ii in 1:N
+        # "prefPressVacNEW": social pressure proxy = fraction UNvaccinated among ego+neighbors
+        prefPressVacNEW=(length(listneigh2[ii])+1-listaVacneigh[ii])/(length(listneigh2[ii])+1)
+    	phi=sqrt(phiVac[ii]*Cons[ii])
+        # own attitude toward vaccination shifts toward a mix of prefVac (empirical)
+        # vs. external signal / social pressure weighted by φ
+        global attiVacS[ii]+=attiVacadap*((1-phi)*prefVacS[ii]+(phi)*(gammasocial1*prefPressVacNEW+(1-gammasocial1)*GVac)-attiVacS[ii])
+        global attiVacS[ii]=minimum([maximum([attiVacS[ii],0.0]),1.0])
+
+        # injunctive expectation (what others think ought to do)
+        global attiAvVacS[ii]+=attiAvVacadap*((1-phi)*attiVacSp[ii]+(phi)*(gammasocial2*prefPressVacNEW+(1-gammasocial2)*GVac)-attiAvVacS[ii])
+        global attiAvVacS[ii]=minimum([maximum([attiAvVac[ii],0.0]),1.0])
+
+        # descriptive norm proxy (neighbors' preferences)
+        global prefAvVacS[ii]+=prefAvVacadap*((1-phi)*attiAvVacSp[ii]+(phi)*(gammasocial3*prefPressVacNEW+(1-gammasocial3)*GVac)-prefAvVacS[ii])
+        global prefAvVacS[ii]=minimum([maximum([prefAvVacS[ii],0.0]),1.0])
+    end
+    return attiVacS, attiAvVacS, prefAvVacS     
+end  
+                                
+# ============================== RECORDING VECTORS ===========================
+global infcomp=Vector{Float64}(undef,0)  # outbreak size per season
+global vaccomp=Vector{Float64}(undef,0)  # vaccination coverage per season
+                            
+# ============================== Neighborhood counts =========================
+# listaVacneigh[i] = vaccinated count in ego+neighbors (used in att_update)
+listaVacneigh=zeros(N)
+for il in 1:N
+    Vacneigh=0
+    if ndVac[il]==2
+        Vacneigh+=1
+    end
+    for jj in 1:length(listneigh2[il])
+        if ndVac[listneigh2[il][jj]]==2
+            Vacneigh+=1
+        end
+    end
+    listaVacneigh[il]=copy(Vacneigh)
+end
+
+# ============================== Consensus =========================
+function Consensus(N::Int,listaVacneigh::Vector{Float64},listneigh2::Vector{Any})
+    X_primeS=ones(N)
+    for i in 1:N
+        X_primeS[i]=2*abs((listaVacneigh[i]/(length(listneigh2[i])+self))-0.5)
+    end
+    return X_primeS
+end
+            
+# ============================== MAIN DYNAMICS LOOP ==========================
+global i=1
+global checkfin=0
+            
+while i<vacCycles && checkfin==0
+    # push current choice into recent history (length memChoice2)
+    for ii in 1:N
+        Choicehistp=deepcopy(Choicehist2[ii])
+        pushfirst!(Choicehistp,ndVac[ii])
+        Choicehist2[ii]=deepcopy(getindex(Choicehistp, 1:memChoice2))
+    end
+
+    if count(iw->(iw==2),ndVac)==N+1
+        # trivial absorbing state guard (unreachable with integers) – preserved
+        global checkfin=1
+        push!(vaccomp,1)
+    else
+        # record coverage
+        push!(vaccomp,count(iw->(iw==2),ndVac)/N)
+
+        # simulate one "season" to get risk statistics and update payoff memories
+        outsize, infratev, infneighratev, Payoffhist2 =Season_Sim(N, Nsim, ndVac,mu,beta,listneigh1,Payoffhist2,memPayoff2)
+        push!(infcomp,outsize)
+
+        # --------------- Decision update: probability prefVac in [0,1] --------------
+        global prefVac=zeros(N)
+        for ii in 1:N
+            if length(listneigh2[ii])>0
+                # safety weight in [0,1] mixes global & local (self vs. neighbors)
+                if ndVac[ii]==2
+                    safety=min(1-infneighratev[ii],1)
+                else
+                    safety=min(1-infratev[ii]),1)
+                end
+
+                # recency-weighted averages of payoffs (safety used as decay)
+                sumaPayVac=0; numVac=0; sumaPayUnVac=0; numUnVac=0
+                for jj in 1:memChoice2
+                    sumaPayVac+=(-CV)*safety^(jj-1)
+                    numVac+=safety^(jj-1)
+                    sumaPayUnVac+=Payoffhist2[ii][jj]*safety^(jj-1)
+                    numUnVac+=safety^(jj-1)
+                end
+                avPayVac = numVac==0 ? 0 : 1+(sumaPayVac/numVac)
+                avPayUnVac = numUnVac==0 ? 0 : 1+(sumaPayUnVac/numUnVac)
+
+                # logistic preference transform of payoff advantage
+                prefLearnVac=0.5+sign((avPayUnVac-avPayVac))*(1/(1+exp(-abs(avPayUnVac-avPayVac)))-0.5)
+
+		phi=sqrt(phiVac[ii]*Cons[ii])
+
+                # Blend empirical vs. normative channels with φ and safety
+                prefVac[ii]=minimum([1.0,maximum([0.0,
+                    (1-safety)*((1-phi)*prefLearnVac+phi*prefAvVac[ii]) +
+                    safety*((1-phi)*attiVac[ii]+phi*attiAvVac[ii])
+                ])])
+
+                # Sample a new binary decision from prefVac
+                ndVacBefore=deepcopy(ndVac[ii])
+                if rand()<prefVac[ii]
+                    ndVac[ii]=1   # choose unvaccinated
+                else
+                    ndVac[ii]=2   # choose vaccinated
+                end
+
+                # Update vaccinated-neighbor counts incrementally
+                diff=ndVac[ii]-ndVacBefore
+                if diff!=0
+                    listaVacneigh[ii]+=diff
+                    for iju in 1:length(listneigh2[ii])
+                        listaVacneigh[listneigh2[ii][iju]]+=diff    
+                    end
+                end
+            end
+        end
+
+        # Recompute φ’s and update social attitudes
+        phiVac=phi_Vac(N,listneigh2,memChoice2,Choicehist2)
+        Cons=Consensus(N,listaVacneigh,listneigh2)
+        attiVac,attiAvVac,prefAvVac=att_update(prefAvVac,attiVac,attiAvVac,attiVacadap,attiAvVacadap,prefAvVacadap,phiVac,Consensus,prefVac,gammasocial1,gammasocial2,gammasocial3,GVac,listneigh2,listaVacneigh)
+    end
+
+    # Early stop: both infection and vaccination time series stabilized
+    if check_approx_equal(infcomp, 10,0.05) && check_approx_equal(vaccomp, 10,0.05)
+        checkfin=1
+        println("last: ",i)
+    end
+    global i+=1
+end
+
+# ============================== OUTPUTS =====================================
+# InfoMatrix collects summary statistics at the final season
+InfoMatrix=[infcomp[length(infcomp)],vaccomp[length(vaccomp)],mean(prefVac),mean(attiVac),mean(attiAvVac),mean(prefAvVac)]
+InfoMatrixName=string("InfoMatrix_",sume,"_",runn,".csv")
+writedlm( InfoMatrixName,  InfoMatrix, ',')
+
+# timing
+end_time = time()
+execution_time = end_time - start_time
+println("Execution time: ", execution_time/60, " minutes")
